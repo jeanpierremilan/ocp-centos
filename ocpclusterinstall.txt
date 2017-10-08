@@ -1,0 +1,125 @@
+# ++++++++++++++++++++++++ #
+# OCP CLUSTER MACHINES     #
+# ++++++++++++++++++++++++ #
+
+# check minimal hardware required
+# https://docs.openshift.org/3.6/install_config/install/prerequisites.html#system-requirements
+
+sudo yum update -y 
+
+# configure SELINUXTYPE=targeted in the /etc/selinux/config
+
+#++++++++++++++++++++  if /var <50GB  +++++++++++++++++++++++++
+pvcreate /dev/sdX
+vgextend vgname /dev/sdX
+lvextend -L+50Gi /dev/vgname/lvname
+resize2fs /dev/vgname/lvname
+#++++++++++++++++++++  end if /var <50GB  +++++++++++++++++++++
+
+yum install -y epel-release
+yum install -y ntp python wget ansible docker git pyOpenSSL python-cryptography
+yum install -y net-tools bind-utils iptables-services bridge-utils bash-completion kexec-tools sos psacct
+
+#number of cores used by OCP
+export GOMAXPROCS=2
+
+#Check DNS and NSCD in all nodes
+hostnamectl set-hostname console.gpocpdev.io
+echo "10.0.1.5 console.gpocpdev.io" | tee -a /etc/hosts
+
+echo "10.0.0.5 dev.local" | tee -a /etc/hosts
+echo "10.0.0.4 console.gpocp.io" | tee -a /etc/hosts
+echo "10.0.0.6 gpocpnode1.io" | tee -a /etc/hosts
+echo "10.0.0.7 gpocpnode2.io" | tee -a /etc/hosts
+
+sed -i 's/localhost.localdomain/dev.local/g' /etc/sysconfig/network
+
+for i in {console.gpocp.io,ocpnode1.io,ocpnode2.io}; do ping -c 2 $i; done
+
+#Enable NTP on the Cluster
+systemctl enable ntpd
+systemctl start ntpd
+systemctl status ntpd
+
+#Enable Docker
+sed -i '/OPTIONS=.*/c\OPTIONS="--selinux-enabled --insecure-registry 172.30.0.0/16"' /etc/sysconfig/docker
+#Reconfiguring Docker Storage
+
+systemctl enable docker
+systemctl start docker
+systemctl status docker
+
+#iptables
+systemctl disable iptables
+#systemctl start iptables
+#systemctl status iptables
+
+#stop dnsmasq
+systemctl stop dnsmasq
+
+#SAP Vora Distributed Log (DLog)
+cat /proc/sys/fs/file-max
+echo "fs.file-max=983040" | tee -a /etc/sysctl.conf
+sysctl -p
+cat /etc/security/limits.conf
+echo "*                -       nofile          1000000" | tee -a /etc/security/limits.conf
+cat /etc/security/limits.conf
+locale
+export LC_ALL=en_US.UTF-8
+locale
+#Log out or reboot so that the ulimit change takes effect.
+exit
+sudo su -
+echo umask 0022 | tee -a /etc/profile
+
+#Configure iptables
+systemctl disable firewalld
+service firewalld stop
+
+git clone https://github.com/openshift/openshift-ansible
+git clone https://github.com/jeanpierremilan/ocp-centos.git 
+
+#vi inventoryfile
+	[OSEv3:children]
+	masters
+	etcd
+	nodes
+
+	[OSEv3:vars]
+	ansible_ssh_user=root
+	deployment_type=origin
+	openshift_master_identity_providers=[{'name': 'htpasswd_auth', 'login': 'true', 'challenge': 'true', 'kind': 'HTPasswdPasswordIdentityProvider', 'filename': '/etc/origin/master/htpasswd'}]
+	#containerized=true
+	openshift_release=v3.6.0
+	openshift_image_tag=v3.6.0
+
+	openshift_public_hostname=console.gpocp.io
+	openshift_master_default_subdomain=apps.gpocp.io
+
+
+	[masters]
+	console.gpocp.io openshift_schedulable=true
+
+	[etcd]
+	console.gpocp.io
+
+	[nodes]
+	ocpnode1.io openshift_node_labels="{'region': 'infra', 'zone': 'default'}" openshift_schedulable=true
+	ocpnode2.io openshift_node_labels="{'region': 'infra', 'zone': 'default'}" openshift_schedulable=true
+
+ansible-playbook -i ./ocp-centos/inventory_cluster.erb ./openshift-ansible/playbooks/byo/config.yml	
+
+cp /etc/resolv.conf /etc/origin/node/
+systemctl restart origin-node.service
+systemctl status origin-master.service
+# origin-master.service masked
+systemctl unmask origin-master.service
+systemctl enable origin-master.service
+systemctl start origin-master.service
+
+htpasswd -b /etc/origin/master/htpasswd gpadmin openshift
+
+export KUBECONFIG=/etc/origin/master/admin.kubeconfig
+sudo oc login -u system:admin
+sudo oc get nodes
+sudo oc status
