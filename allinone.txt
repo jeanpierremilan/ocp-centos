@@ -1,0 +1,133 @@
+##################################
+# OCP ORIGIN	    INSTALLATION #
+##################################
+
+# ++++++++++++++++ #
+# OCP MACHINES DEV #
+# ++++++++++++++++ #
+
+
+# check minimal hardware required
+# https://docs.openshift.org/3.6/install_config/install/prerequisites.html#system-requirements
+
+sudo yum update -y 
+
+# configure SELINUXTYPE=targeted in the /etc/selinux/config
+
+yum install -y epel-release
+yum install -y ntp python wget ansible docker git pyOpenSSL python-cryptography
+yum install -y net-tools bind-utils iptables-services bridge-utils bash-completion kexec-tools sos psacct
+
+#number of cores used by OCP
+export GOMAXPROCS=2
+
+#Check DNS and NSCD in all nodes
+hostnamectl set-hostname console.gpocpdev.io
+echo "10.0.1.5 console.gpocpdev.io" | tee -a /etc/hosts
+
+#Enable NTP on the Cluster
+systemctl enable ntpd
+systemctl start ntpd
+systemctl status ntpd
+
+#Enable Docker
+sed -i '/OPTIONS=.*/c\OPTIONS="--selinux-enabled --insecure-registry 172.30.0.0/16"' /etc/sysconfig/docker
+#Reconfiguring Docker Storage
+
+systemctl enable docker
+systemctl start docker
+systemctl status docker
+
+#iptables
+systemctl disable iptables
+#systemctl start iptables
+#systemctl status iptables
+
+#stop dnsmasq
+systemctl stop dnsmasq
+
+# ++++++++++++++++ #
+# OPTIONAL IN DEV  #
+# ++++++++++++++++ #
+
+#CREATE 50G SWAP
+#CREATE THE PARTITIONS FOR HDP
+fdisk /dev/sdX
+mkswap -L SWAP /dev/sdX1
+swapon /dev/sdX1
+lsblk
+free
+mkfs.ext4 /dev/sdc2
+mkdir /mnt/data
+blkid
+echo "UUID=XXXXXXXXXX /mnt/data ext4 defaults 0 0" | tee -a /etc/fstab
+echo "UUID=YYYYYY none swap defaults 0 0" | tee -a /etc/fstab
+mount -a
+df -Th
+
+# create raid1 in master node
+mdadm --create /dev/md0 --level=1 --raid-devices=2 /dev/sdc2 /dev/sdd2
+mkfs.ext4 /dev/md0
+blkid 
+echo "UUID=XXXXXXXXXX /mnt/data ext4 defaults 0 0" | tee -a /etc/fstab
+
+reboot
+# ++++++++++++++++++++++++++ #
+
+git clone https://github.com/openshift/openshift-ansible
+git clone https://github.com/jeanpierremilan/ocp-centos.git 
+
+#vi inventoryfile
+	[OSEv3:children]
+	masters
+	etcd
+	nodes
+
+	[OSEv3:vars]
+	ansible_ssh_user=root
+	deployment_type=origin
+	openshift_master_identity_providers=[{'name': 'htpasswd_auth', 'login': 'true', 'challenge': 'true', 'kind': 'HTPasswdPasswordIdentityProvider', 'filename': '/etc/origin/master/htpasswd'}]
+	#containerized=true
+	openshift_release=v3.6.0
+	openshift_image_tag=v3.6.0
+
+	openshift_public_hostname=console.gpocpdev.io
+	openshift_master_default_subdomain=apps.gpocpdev.io
+
+
+	[masters]
+	console.gpocpdev.io openshift_schedulable=true
+
+	[etcd]
+	console.gpocpdev.io
+
+	[nodes]
+	console.gpocpdev.io openshift_node_labels="{'region': 'infra', 'zone': 'default'}" openshift_schedulable=true
+
+vi /etc/ssh/sshd_config
+#PasswordAuthentication yes
+	
+ssh-keygen -t rsa
+passwd
+ssh-copy-id root@console.gpocpdev.io
+
+cat /etc/sysconfig/network
+hostname
+sed -i 's/localhost.localdomain/console.gpocpdev.io/g' /etc/sysconfig/network
+
+#add default dns to /etc/dnsmasq.conf
+vi /etc/dnsmasq.conf
+systemctl restart dnsmasq.service
+
+ansible-playbook -i ./ocp-centos/inventory.erb ./openshift-ansible/playbooks/byo/config.yml	
+
+cp /etc/resolv.conf /etc/origin/node/
+systemctl restart origin-node.service
+systemctl restart origin-master.service
+
+htpasswd -b /etc/origin/master/htpasswd gpadmin openshift
+
+export KUBECONFIG=/etc/origin/master/admin.kubeconfig
+sudo oc login -u system:admin
+sudo oc get nodes
+sudo oc status
